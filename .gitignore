@@ -1,0 +1,12 @@
+node_modules/
+.next/
+.next-build/
+.next-preview/
+/out/
+dist/
+.env
+.env.local
+.env.*.local
+infra/.aws-sam/
+infra/src/node_modules/
+*.log

@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: CivicSignal serverless community issue reporting API
+
+Parameters:
+  FrontendOrigin:
+    Type: String
+    Default: http://localhost:3000
+    Description: Frontend origin only, with no trailing slash.
+    AllowedPattern: '^https?://[^/]+$'
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures:
+      - arm64
+    MemorySize: 256
+    Timeout: 15
+    Environment:
+      Variables:
+        REPORTS_TABLE: !Ref ReportsTable
+        REPORTS_BUCKET: !Ref ReportsBucket
+
+Resources:
+  ReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: reportId
+          AttributeType: S
+        - AttributeName: feedPartition
+          AttributeType: S
+        - AttributeName: createdAtReportId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: reportId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: FeedIndex
+          KeySchema:
+            - AttributeName: feedPartition
+              KeyType: HASH
+            - AttributeName: createdAtReportId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireUnsubmittedPhotos
+            Status: Enabled
+            Prefix: pending/
+            ExpirationInDays: 1
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - !Ref FrontendOrigin
+            AllowedMethods:
+              - GET
+              - POST
+            AllowedHeaders:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3600
+
+  CivicUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-admins'
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+
+  CivicAdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admins
+      Description: Administrators allowed to update community report status.
+      UserPoolId: !Ref CivicUserPool
+
+  CivicUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${AWS::StackName}-web'
+      UserPoolId: !Ref CivicUserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - !Sub '${FrontendOrigin}/admin/callback/'
+      LogoutURLs:
+        - !Sub '${FrontendOrigin}/'
+
+  CivicUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'civicsignal-${AWS::AccountId}-${AWS::Region}'
+      UserPoolId: !Ref CivicUserPool
+
+  CivicApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref FrontendOrigin
+        AllowHeaders:
+          - authorization
+          - content-type
+        AllowMethods:
+          - GET
+          - POST
+          - PATCH
+          - OPTIONS
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 30
+        ThrottlingRateLimit: 15
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: '$request.header.Authorization'
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${CivicUserPool}'
+              audience:
+                - !Ref CivicUserPoolClient
+
+  CivicApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handler.handler
+      Description: Public report reads and Cognito-protected community writes and administrator updates.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReportsTable
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: ReadAndPresignReportPhotos
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub '${ReportsBucket.Arn}/*'
+      Events:
+        ListReports:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CivicApi
+            Path: /reports
+            Method: GET
+        GetReport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CivicApi
+            Path: /reports/{reportId}
+            Method: GET
+        CreateReport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CivicApi
+            Path: /reports
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        PresignReportPhoto:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CivicApi
+            Path: /uploads/presign
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        UpdateReport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CivicApi
+            Path: /reports/{reportId}
+            Method: PATCH
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for the CivicSignal HTTP API.
+    Value: !Sub 'https://${CivicApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  ReportsTableName:
+    Description: DynamoDB table containing issue reports.
+    Value: !Ref ReportsTable
+  ReportsBucketName:
+    Description: Private S3 bucket storing report photos.
+    Value: !Ref ReportsBucket
+  UserPoolId:
+    Description: Cognito user pool used for customer and administrator sign-in.
+    Value: !Ref CivicUserPool
+  UserPoolClientId:
+    Description: Public OAuth client ID for the web app.
+    Value: !Ref CivicUserPoolClient
+  CognitoDomain:
+    Description: Cognito hosted UI domain, including HTTPS scheme.
+    Value: !Sub 'https://${CivicUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
